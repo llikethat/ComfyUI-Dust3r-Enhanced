@@ -1,0 +1,15 @@
+# ComfyUI-Dust3r-Enhanced Requirements
+# These are in addition to ComfyUI's base requirements
+
+torch>=2.0.0
+torchvision>=0.15.0
+numpy
+Pillow
+scipy
+tqdm
+trimesh
+opencv-python
+einops
+matplotlib
+roma
+huggingface-hub>=0.22.0
