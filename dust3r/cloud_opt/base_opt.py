@@ -377,7 +377,7 @@ class BasePCOptimizer (nn.Module):
         else:
             raise ValueError(f'bad value for {init=}')
 
-        global_alignment_loop(self, **kw)
+        return global_alignment_loop(self, **kw)
 
     @torch.no_grad()
     def mask_sky(self):
@@ -443,6 +443,12 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
 
     print(f"Optimizing {len(params)} parameters")
     
+    # Debug: print depth map statistics before optimization
+    if hasattr(net, 'im_depthmaps'):
+        with torch.inference_mode(False):
+            depths = net.im_depthmaps.exp()
+            print(f"Depth stats before optimization: min={depths.min().item():.4f}, max={depths.max().item():.4f}, mean={depths.mean().item():.4f}")
+    
     lr_base = lr
     optimizer = torch.optim.Adam(params, lr=lr, betas=(0.9, 0.9))
 
@@ -482,9 +488,23 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
                         break
                     
                     loss.backward()
+                    
+                    # Debug: Print gradient info for first few iterations
+                    if bar.n < 3:
+                        for name, p in net.named_parameters():
+                            if p.requires_grad and p.grad is not None and not name.startswith('im_conf'):
+                                grad_norm = p.grad.norm().item()
+                                print(f"  Grad {name}: norm={grad_norm:.6f}, max={p.grad.abs().max().item():.6f}")
+                    
                     optimizer.step()
-                    final_loss = float(loss)
+                    final_loss = float(loss.detach())
                     bar.set_postfix_str(f'{lr=:g} loss={final_loss:g}')
                     bar.update()
+    
+    # Debug: print depth map statistics after optimization
+    if hasattr(net, 'im_depthmaps'):
+        with torch.inference_mode(False):
+            depths = net.im_depthmaps.exp()
+            print(f"Depth stats after optimization: min={depths.min().item():.4f}, max={depths.max().item():.4f}, mean={depths.mean().item():.4f}")
     
     return final_loss
