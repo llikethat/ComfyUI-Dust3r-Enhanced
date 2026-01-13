@@ -107,9 +107,16 @@ class PointCloudOptimizer(BasePCOptimizer):
         return param
 
     def get_focals(self):
-        # im_focals is now a stacked tensor from ParameterStack, not a ParameterList
+        """Get focal lengths from log-focals."""
         log_focals = self.im_focals
-        return (log_focals / self.focal_break).exp()
+        res = (log_focals / self.focal_break).exp()
+        
+        # Check for lost gradients and apply workaround if needed
+        if torch.is_grad_enabled() and log_focals.requires_grad and not res.requires_grad:
+            print(f"WARNING: focals.exp() lost gradients, applying workaround")
+            res = torch.exp(log_focals / self.focal_break + 0.0)
+        
+        return res
 
     def get_known_focal_mask(self):
         # After ParameterStack, im_focals is a single tensor
@@ -150,14 +157,47 @@ class PointCloudOptimizer(BasePCOptimizer):
         """Get depth maps, optionally raw (stacked) or as list."""
         depthmaps = self.im_depthmaps
         
+        # Debug: Check tensor properties
+        grad_enabled = torch.is_grad_enabled()
+        
+        # Check if we're in inference mode (PyTorch 1.9+)
+        try:
+            inference_mode = torch.is_inference_mode_enabled()
+        except AttributeError:
+            inference_mode = False
+        
         # Apply exponential to get actual depths from log-depths
         res = depthmaps.exp()
         
         # Debug: Check if gradients were unexpectedly lost
-        if torch.is_grad_enabled() and depthmaps.requires_grad and not res.requires_grad:
+        if grad_enabled and depthmaps.requires_grad and not res.requires_grad:
             print(f"WARNING: depthmaps.exp() lost gradients!")
+            print(f"  torch.is_grad_enabled()={grad_enabled}")
+            print(f"  torch.is_inference_mode_enabled()={inference_mode}")
             print(f"  Input: requires_grad={depthmaps.requires_grad}, is_leaf={depthmaps.is_leaf}")
             print(f"  Output: requires_grad={res.requires_grad}, grad_fn={res.grad_fn}")
+            print(f"  Input dtype: {depthmaps.dtype}, device: {depthmaps.device}")
+            
+            # Try workaround with explicit enable_grad
+            with torch.enable_grad():
+                res = depthmaps.exp()
+                if res.requires_grad:
+                    print(f"  Workaround with enable_grad successful! grad_fn={res.grad_fn}")
+            
+            # If still failed, try creating fresh tensor
+            if not res.requires_grad:
+                print(f"  enable_grad workaround failed, trying fresh tensor...")
+                with torch.enable_grad():
+                    fresh_depths = depthmaps.detach().clone().requires_grad_(True)
+                    res = fresh_depths.exp()
+                    if res.requires_grad:
+                        print(f"  Fresh tensor workaround successful!")
+                    else:
+                        print(f"  All workarounds failed!")
+        
+        if not raw:
+            res = [dm[:h*w].view(h, w) for dm, (h, w) in zip(res, self.imshapes)]
+        return res
         
         if not raw:
             res = [dm[:h*w].view(h, w) for dm, (h, w) in zip(res, self.imshapes)]
@@ -187,19 +227,21 @@ class PointCloudOptimizer(BasePCOptimizer):
 
     def forward(self):
         """Compute the alignment loss."""
-        pw_poses = self.get_pw_poses()  # cam-to-world
-        pw_adapt = self.get_adaptors().unsqueeze(1)
-        proj_pts3d = self.get_pts3d(raw=True)
+        # Ensure gradient computation is enabled
+        with torch.enable_grad():
+            pw_poses = self.get_pw_poses()  # cam-to-world
+            pw_adapt = self.get_adaptors().unsqueeze(1)
+            proj_pts3d = self.get_pts3d(raw=True)
 
-        # Rotate pairwise prediction according to pw_poses
-        aligned_pred_i = geotrf(pw_poses, pw_adapt * self._stacked_pred_i)
-        aligned_pred_j = geotrf(pw_poses, pw_adapt * self._stacked_pred_j)
+            # Rotate pairwise prediction according to pw_poses
+            aligned_pred_i = geotrf(pw_poses, pw_adapt * self._stacked_pred_i)
+            aligned_pred_j = geotrf(pw_poses, pw_adapt * self._stacked_pred_j)
 
-        # Compute the loss
-        li = self.dist(proj_pts3d[self._ei], aligned_pred_i, weight=self._weight_i).sum() / self.total_area_i
-        lj = self.dist(proj_pts3d[self._ej], aligned_pred_j, weight=self._weight_j).sum() / self.total_area_j
+            # Compute the loss
+            li = self.dist(proj_pts3d[self._ei], aligned_pred_i, weight=self._weight_i).sum() / self.total_area_i
+            lj = self.dist(proj_pts3d[self._ej], aligned_pred_j, weight=self._weight_j).sum() / self.total_area_j
 
-        loss = li + lj
+            loss = li + lj
         
         return loss
 
