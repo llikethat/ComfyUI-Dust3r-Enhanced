@@ -147,7 +147,49 @@ class BasePCOptimizer (nn.Module):
         # normalize rotation
         Q = poses[:, :4]
         T = signed_expm1(poses[:, 4:7])
-        RT = roma.RigidUnitQuat(Q, T).normalize().to_homogeneous()
+        
+        # Try roma first - it's faster when it works
+        try:
+            rigid = roma.RigidUnitQuat(Q, T)
+            normalized = rigid.normalize()
+            RT = normalized.to_homogeneous()
+            
+            # Check if gradients were preserved
+            if poses.requires_grad and torch.is_grad_enabled() and not RT.requires_grad:
+                raise RuntimeError("Roma lost gradients")
+            return RT
+        except Exception as e:
+            if torch.is_grad_enabled() and poses.requires_grad:
+                print(f"WARNING: roma operations failed ({e}), using manual fallback")
+        
+        # Fallback: manually construct the homogeneous matrix using pure PyTorch
+        # This is fully differentiable
+        batch_size = Q.shape[0]
+        device = Q.device
+        
+        # Normalize quaternion (w, x, y, z)
+        Q_norm = Q / (Q.norm(dim=-1, keepdim=True) + 1e-8)
+        w, x, y, z = Q_norm[:, 0], Q_norm[:, 1], Q_norm[:, 2], Q_norm[:, 3]
+        
+        # Build rotation matrix from quaternion (fully differentiable)
+        # Using the standard quaternion to rotation matrix formula
+        R = torch.zeros(batch_size, 3, 3, device=device, dtype=Q.dtype)
+        R[:, 0, 0] = 1 - 2*(y*y + z*z)
+        R[:, 0, 1] = 2*(x*y - w*z)
+        R[:, 0, 2] = 2*(x*z + w*y)
+        R[:, 1, 0] = 2*(x*y + w*z)
+        R[:, 1, 1] = 1 - 2*(x*x + z*z)
+        R[:, 1, 2] = 2*(y*z - w*x)
+        R[:, 2, 0] = 2*(x*z - w*y)
+        R[:, 2, 1] = 2*(y*z + w*x)
+        R[:, 2, 2] = 1 - 2*(x*x + y*y)
+        
+        # Build homogeneous transformation matrix
+        RT = torch.zeros(batch_size, 4, 4, device=device, dtype=Q.dtype)
+        RT[:, :3, :3] = R
+        RT[:, :3, 3] = T
+        RT[:, 3, 3] = 1
+        
         return RT
 
     def _set_pose(self, poses, idx, R, T=None, scale=None, force=False):
@@ -344,6 +386,16 @@ class BasePCOptimizer (nn.Module):
 
 
 def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-6, verbose=False):
+    """Optimization loop for global alignment.
+    
+    This function runs the optimization to align the point clouds globally.
+    """
+    # Ensure gradients are enabled globally
+    torch.set_grad_enabled(True)
+    
+    # Ensure the network is in training mode
+    net.train()
+    
     # Filter to only get the actual optimization parameters (not im_conf)
     params = [p for name, p in net.named_parameters() 
               if p.requires_grad and not name.startswith('im_conf')]
@@ -351,15 +403,20 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
     if not params:
         print("Warning: No parameters to optimize!")
         return net
-
+    
+    # Debug: verify parameter states
     if verbose:
-        print([name for name, value in net.named_parameters() if value.requires_grad])
+        print("Parameters to optimize:")
+        for name, p in net.named_parameters():
+            if p.requires_grad and not name.startswith('im_conf'):
+                print(f"  {name}: shape={p.shape}, device={p.device}, requires_grad={p.requires_grad}")
 
     print(f"Optimizing {len(params)} parameters")
     
     lr_base = lr
     optimizer = torch.optim.Adam(params, lr=lr, betas=(0.9, 0.9))
 
+    final_loss = None
     with tqdm.tqdm(total=niter) as bar:
         while bar.n < bar.total:
             t = bar.n / bar.total
@@ -374,21 +431,40 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
 
             optimizer.zero_grad()
             
-            # Compute loss with gradients explicitly enabled
-            torch.set_grad_enabled(True)
+            # Compute loss - gradients should flow
             loss = net()
             
             # Check if loss has gradient
             if not loss.requires_grad:
                 print(f"Warning: loss does not require grad! loss={loss}")
-                # Try to trace why
+                print(f"torch.is_grad_enabled()={torch.is_grad_enabled()}")
+                
+                # Try to identify the source of the problem
+                print("\nParameter gradient status:")
                 for name, p in net.named_parameters():
                     if p.requires_grad and not name.startswith('im_conf'):
-                        print(f"  {name}: requires_grad={p.requires_grad}, grad_fn={p.grad_fn}")
-                break
+                        print(f"  {name}: requires_grad={p.requires_grad}, is_leaf={p.is_leaf}")
+                
+                # Fallback: Try to enable gradients on the loss
+                if loss.requires_grad == False and torch.is_grad_enabled():
+                    print("\nAttempting fallback: Creating differentiable loss...")
+                    # Force a new forward pass with explicit gradient tracking
+                    for param in params:
+                        param.requires_grad_(True)
+                    loss = net()
+                    
+                    if not loss.requires_grad:
+                        print("Fallback failed - optimization cannot continue")
+                        break
+                    else:
+                        print("Fallback successful - continuing optimization")
+                else:
+                    break
             
             loss.backward()
             optimizer.step()
-            loss = float(loss)
-            bar.set_postfix_str(f'{lr=:g} loss={loss:g}')
+            final_loss = float(loss)
+            bar.set_postfix_str(f'{lr=:g} loss={final_loss:g}')
             bar.update()
+    
+    return final_loss

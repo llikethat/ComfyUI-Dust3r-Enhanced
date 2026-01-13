@@ -147,51 +147,35 @@ class PointCloudOptimizer(BasePCOptimizer):
         return param
 
     def get_depthmaps(self, raw=False):
-        # Ensure we're working with a tensor that tracks gradients
+        """Get depth maps, optionally raw (stacked) or as list."""
         depthmaps = self.im_depthmaps
-        if not depthmaps.requires_grad:
-            print(f"WARNING: im_depthmaps.requires_grad is False, forcing True")
-            depthmaps = depthmaps.detach().requires_grad_(True)
         
+        # Apply exponential to get actual depths from log-depths
         res = depthmaps.exp()
         
-        if not res.requires_grad:
+        # Debug: Check if gradients were unexpectedly lost
+        if torch.is_grad_enabled() and depthmaps.requires_grad and not res.requires_grad:
             print(f"WARNING: depthmaps.exp() lost gradients!")
-            print(f"  depthmaps.requires_grad={depthmaps.requires_grad}")
-            print(f"  depthmaps.grad_fn={depthmaps.grad_fn}")
-            print(f"  res.grad_fn={res.grad_fn}")
+            print(f"  Input: requires_grad={depthmaps.requires_grad}, is_leaf={depthmaps.is_leaf}")
+            print(f"  Output: requires_grad={res.requires_grad}, grad_fn={res.grad_fn}")
         
         if not raw:
             res = [dm[:h*w].view(h, w) for dm, (h, w) in zip(res, self.imshapes)]
         return res
 
     def depth_to_pts3d(self):
-        # Get depths and  projection params if not provided
+        """Convert depth maps to 3D point clouds in world coordinates."""
+        # Get depths and projection params
         focals = self.get_focals()
         pp = self.get_principal_points()
         im_poses = self.get_im_poses()
         depth = self.get_depthmaps(raw=True)
-
-        # Debug gradient flow
-        if not depth.requires_grad:
-            print(f"DEBUG depth_to_pts3d: depth.requires_grad=False!")
-            print(f"  im_depthmaps.requires_grad={self.im_depthmaps.requires_grad}")
         
-        # get pointmaps in camera frame
+        # Get pointmaps in camera frame
         rel_ptmaps = _fast_depthmap_to_pts3d(depth, self._grid, focals, pp=pp)
         
-        if not rel_ptmaps.requires_grad:
-            print(f"DEBUG: rel_ptmaps.requires_grad=False after _fast_depthmap_to_pts3d")
-            print(f"  depth.requires_grad={depth.requires_grad}")
-            print(f"  focals.requires_grad={focals.requires_grad}")
-        
-        # project to world frame
+        # Project to world frame
         result = geotrf(im_poses, rel_ptmaps)
-        
-        if not result.requires_grad:
-            print(f"DEBUG: result.requires_grad=False after geotrf")
-            print(f"  im_poses.requires_grad={im_poses.requires_grad}")
-            print(f"  rel_ptmaps.requires_grad={rel_ptmaps.requires_grad}")
         
         return result
 
@@ -202,31 +186,20 @@ class PointCloudOptimizer(BasePCOptimizer):
         return res
 
     def forward(self):
+        """Compute the alignment loss."""
         pw_poses = self.get_pw_poses()  # cam-to-world
         pw_adapt = self.get_adaptors().unsqueeze(1)
         proj_pts3d = self.get_pts3d(raw=True)
 
-        # rotate pairwise prediction according to pw_poses
+        # Rotate pairwise prediction according to pw_poses
         aligned_pred_i = geotrf(pw_poses, pw_adapt * self._stacked_pred_i)
         aligned_pred_j = geotrf(pw_poses, pw_adapt * self._stacked_pred_j)
 
-        # compute the loss
+        # Compute the loss
         li = self.dist(proj_pts3d[self._ei], aligned_pred_i, weight=self._weight_i).sum() / self.total_area_i
         lj = self.dist(proj_pts3d[self._ej], aligned_pred_j, weight=self._weight_j).sum() / self.total_area_j
 
         loss = li + lj
-        
-        # Debug: check if loss requires grad
-        if not loss.requires_grad:
-            print(f"WARNING: Loss does not require grad!")
-            print(f"  li.requires_grad={li.requires_grad}, lj.requires_grad={lj.requires_grad}")
-            print(f"  proj_pts3d.requires_grad={proj_pts3d.requires_grad}")
-            print(f"  pw_poses.requires_grad={pw_poses.requires_grad}")
-            print(f"  pw_adapt.requires_grad={pw_adapt.requires_grad}")
-            print(f"  im_depthmaps.requires_grad={self.im_depthmaps.requires_grad}")
-            print(f"  im_poses.requires_grad={self.im_poses.requires_grad}")
-            print(f"  im_focals.requires_grad={self.im_focals.requires_grad}")
-            print(f"  torch.is_grad_enabled()={torch.is_grad_enabled()}")
         
         return loss
 
@@ -251,15 +224,23 @@ def ParameterStack(params, keys=None, is_param=None, fill=0):
     # Check if any param originally required grad, or if is_param is explicitly True
     requires_grad = params[0].requires_grad if hasattr(params[0], 'requires_grad') else False
     
-    params = torch.stack(list(params)).float().detach()
+    # Stack the parameters - use clone().detach() to ensure fresh tensor
+    # Then convert to float for consistency
+    stacked = torch.stack(list(params)).float()
     
-    # If is_param is True, always create a Parameter with gradients enabled
+    # If is_param is True, create a Parameter that will track gradients
     if is_param:
-        params = nn.Parameter(params)
-        params.requires_grad_(True)  # Always enable gradients for parameters
-    elif requires_grad:
-        params = nn.Parameter(params)
+        # Create Parameter from the data values (not connected to original graph)
+        # This is the standard way to initialize learnable parameters
+        params = nn.Parameter(stacked.detach().clone())
+        # requires_grad is True by default for nn.Parameter, but be explicit
         params.requires_grad_(True)
+    elif requires_grad:
+        params = nn.Parameter(stacked.detach().clone())
+        params.requires_grad_(True)
+    else:
+        # For non-parameters, just return the detached tensor
+        params = stacked.detach()
     
     return params
 
