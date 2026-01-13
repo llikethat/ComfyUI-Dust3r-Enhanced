@@ -179,11 +179,25 @@ class PointCloudOptimizer(BasePCOptimizer):
         aligned_pred_i = geotrf(pw_poses, pw_adapt * self._stacked_pred_i)
         aligned_pred_j = geotrf(pw_poses, pw_adapt * self._stacked_pred_j)
 
-        # compute the less
+        # compute the loss
         li = self.dist(proj_pts3d[self._ei], aligned_pred_i, weight=self._weight_i).sum() / self.total_area_i
         lj = self.dist(proj_pts3d[self._ej], aligned_pred_j, weight=self._weight_j).sum() / self.total_area_j
 
-        return li + lj
+        loss = li + lj
+        
+        # Debug: check if loss requires grad
+        if not loss.requires_grad:
+            print(f"WARNING: Loss does not require grad!")
+            print(f"  li.requires_grad={li.requires_grad}, lj.requires_grad={lj.requires_grad}")
+            print(f"  proj_pts3d.requires_grad={proj_pts3d.requires_grad}")
+            print(f"  pw_poses.requires_grad={pw_poses.requires_grad}")
+            print(f"  pw_adapt.requires_grad={pw_adapt.requires_grad}")
+            print(f"  im_depthmaps.requires_grad={self.im_depthmaps.requires_grad}")
+            print(f"  im_poses.requires_grad={self.im_poses.requires_grad}")
+            print(f"  im_focals.requires_grad={self.im_focals.requires_grad}")
+            print(f"  torch.is_grad_enabled()={torch.is_grad_enabled()}")
+        
+        return loss
 
 
 def _fast_depthmap_to_pts3d(depth, pixel_grid, focal, pp):

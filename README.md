@@ -21,7 +21,7 @@ Place this entire folder in your ComfyUI custom_nodes directory:
 
 ```bash
 cd /path/to/ComfyUI/custom_nodes/
-git clone https://github.com/llikethat/ComfyUI-Dust3r-Enhanced.git
+git clone https://github.com/your-repo/ComfyUI-Dust3r-Enhanced.git
 ```
 
 Or download and extract to:
