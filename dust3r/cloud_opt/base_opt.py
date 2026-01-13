@@ -325,33 +325,40 @@ class BasePCOptimizer (nn.Module):
         return res
 
     def forward(self, ret_details=False):
-        pw_poses = self.get_pw_poses()  # cam-to-world
-        pw_adapt = self.get_adaptors()
-        proj_pts3d = self.get_pts3d()
-        # pre-compute pixel weights
-        weight_i = {i_j: self.conf_trf(c) for i_j, c in self.conf_i.items()}
-        weight_j = {i_j: self.conf_trf(c) for i_j, c in self.conf_j.items()}
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                pw_poses = self.get_pw_poses()  # cam-to-world
+                pw_adapt = self.get_adaptors()
+                proj_pts3d = self.get_pts3d()
+                
+                # Clone buffers created in inference mode
+                # pre-compute pixel weights
+                weight_i = {i_j: self.conf_trf(c.clone()) for i_j, c in self.conf_i.items()}
+                weight_j = {i_j: self.conf_trf(c.clone()) for i_j, c in self.conf_j.items()}
 
-        loss = 0
-        if ret_details:
-            details = -torch.ones((self.n_imgs, self.n_imgs))
+                loss = 0
+                if ret_details:
+                    details = -torch.ones((self.n_imgs, self.n_imgs))
 
-        for e, (i, j) in enumerate(self.edges):
-            i_j = edge_str(i, j)
-            # distance in image i and j
-            aligned_pred_i = geotrf(pw_poses[e], pw_adapt[e] * self.pred_i[i_j])
-            aligned_pred_j = geotrf(pw_poses[e], pw_adapt[e] * self.pred_j[i_j])
-            li = self.dist(proj_pts3d[i], aligned_pred_i, weight=weight_i[i_j]).mean()
-            lj = self.dist(proj_pts3d[j], aligned_pred_j, weight=weight_j[i_j]).mean()
-            loss = loss + li + lj
+                for e, (i, j) in enumerate(self.edges):
+                    i_j = edge_str(i, j)
+                    # Clone pred tensors created in inference mode
+                    pred_i = self.pred_i[i_j].clone()
+                    pred_j = self.pred_j[i_j].clone()
+                    # distance in image i and j
+                    aligned_pred_i = geotrf(pw_poses[e], pw_adapt[e] * pred_i)
+                    aligned_pred_j = geotrf(pw_poses[e], pw_adapt[e] * pred_j)
+                    li = self.dist(proj_pts3d[i], aligned_pred_i, weight=weight_i[i_j]).mean()
+                    lj = self.dist(proj_pts3d[j], aligned_pred_j, weight=weight_j[i_j]).mean()
+                    loss = loss + li + lj
 
-            if ret_details:
-                details[i, j] = li + lj
-        loss /= self.n_edges  # average over all pairs
+                    if ret_details:
+                        details[i, j] = li + lj
+                loss /= self.n_edges  # average over all pairs
 
-        if ret_details:
-            return loss, details
-        return loss
+                if ret_details:
+                    return loss, details
+                return loss
 
     def compute_global_alignment(self, init=None, niter_PnP=10, **kw):
         if init is None:

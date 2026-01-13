@@ -127,15 +127,20 @@ class PointCloudOptimizer(BasePCOptimizer):
         return param
 
     def get_principal_points(self):
-        return self._pp + 10 * self.im_pp
+        # Clone _pp buffer as it was created in inference mode
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                return self._pp.clone() + 10 * self.im_pp
 
     def get_intrinsics(self):
-        K = torch.zeros((self.n_imgs, 3, 3), device=self.device)
-        focals = self.get_focals().flatten()
-        K[:, 0, 0] = K[:, 1, 1] = focals
-        K[:, :2, 2] = self.get_principal_points()
-        K[:, 2, 2] = 1
-        return K
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                K = torch.zeros((self.n_imgs, 3, 3), device=self.device)
+                focals = self.get_focals().flatten()
+                K[:, 0, 0] = K[:, 1, 1] = focals
+                K[:, :2, 2] = self.get_principal_points()
+                K[:, 2, 2] = 1
+                return K
 
     def get_im_poses(self):  # cam to world
         cam2world = self._get_poses(self.im_poses)
@@ -169,19 +174,24 @@ class PointCloudOptimizer(BasePCOptimizer):
 
     def depth_to_pts3d(self):
         """Convert depth maps to 3D point clouds in world coordinates."""
-        # Get depths and projection params
-        focals = self.get_focals()
-        pp = self.get_principal_points()
-        im_poses = self.get_im_poses()
-        depth = self.get_depthmaps(raw=True)
-        
-        # Get pointmaps in camera frame
-        rel_ptmaps = _fast_depthmap_to_pts3d(depth, self._grid, focals, pp=pp)
-        
-        # Project to world frame
-        result = geotrf(im_poses, rel_ptmaps)
-        
-        return result
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                # Get depths and projection params
+                focals = self.get_focals()
+                pp = self.get_principal_points()
+                im_poses = self.get_im_poses()
+                depth = self.get_depthmaps(raw=True)
+                
+                # Clone _grid buffer as it was created in inference mode
+                grid = self._grid.clone()
+                
+                # Get pointmaps in camera frame
+                rel_ptmaps = _fast_depthmap_to_pts3d(depth, grid, focals, pp=pp)
+                
+                # Project to world frame
+                result = geotrf(im_poses, rel_ptmaps)
+                
+                return result
 
     def get_pts3d(self, raw=False):
         res = self.depth_to_pts3d()
@@ -198,13 +208,22 @@ class PointCloudOptimizer(BasePCOptimizer):
                 pw_adapt = self.get_adaptors().unsqueeze(1)
                 proj_pts3d = self.get_pts3d(raw=True)
 
+                # Clone ALL buffers that were created in inference mode
+                # This is necessary because ComfyUI runs in inference_mode
+                stacked_pred_i = self._stacked_pred_i.clone()
+                stacked_pred_j = self._stacked_pred_j.clone()
+                weight_i = self._weight_i.clone()
+                weight_j = self._weight_j.clone()
+                ei = self._ei.clone()
+                ej = self._ej.clone()
+
                 # Rotate pairwise prediction according to pw_poses
-                aligned_pred_i = geotrf(pw_poses, pw_adapt * self._stacked_pred_i)
-                aligned_pred_j = geotrf(pw_poses, pw_adapt * self._stacked_pred_j)
+                aligned_pred_i = geotrf(pw_poses, pw_adapt * stacked_pred_i)
+                aligned_pred_j = geotrf(pw_poses, pw_adapt * stacked_pred_j)
 
                 # Compute the loss
-                li = self.dist(proj_pts3d[self._ei], aligned_pred_i, weight=self._weight_i).sum() / self.total_area_i
-                lj = self.dist(proj_pts3d[self._ej], aligned_pred_j, weight=self._weight_j).sum() / self.total_area_j
+                li = self.dist(proj_pts3d[ei], aligned_pred_i, weight=weight_i).sum() / self.total_area_i
+                lj = self.dist(proj_pts3d[ej], aligned_pred_j, weight=weight_j).sum() / self.total_area_j
 
                 loss = li + lj
         
