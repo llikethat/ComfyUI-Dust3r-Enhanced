@@ -147,7 +147,20 @@ class PointCloudOptimizer(BasePCOptimizer):
         return param
 
     def get_depthmaps(self, raw=False):
-        res = self.im_depthmaps.exp()
+        # Ensure we're working with a tensor that tracks gradients
+        depthmaps = self.im_depthmaps
+        if not depthmaps.requires_grad:
+            print(f"WARNING: im_depthmaps.requires_grad is False, forcing True")
+            depthmaps = depthmaps.detach().requires_grad_(True)
+        
+        res = depthmaps.exp()
+        
+        if not res.requires_grad:
+            print(f"WARNING: depthmaps.exp() lost gradients!")
+            print(f"  depthmaps.requires_grad={depthmaps.requires_grad}")
+            print(f"  depthmaps.grad_fn={depthmaps.grad_fn}")
+            print(f"  res.grad_fn={res.grad_fn}")
+        
         if not raw:
             res = [dm[:h*w].view(h, w) for dm, (h, w) in zip(res, self.imshapes)]
         return res
@@ -159,10 +172,28 @@ class PointCloudOptimizer(BasePCOptimizer):
         im_poses = self.get_im_poses()
         depth = self.get_depthmaps(raw=True)
 
+        # Debug gradient flow
+        if not depth.requires_grad:
+            print(f"DEBUG depth_to_pts3d: depth.requires_grad=False!")
+            print(f"  im_depthmaps.requires_grad={self.im_depthmaps.requires_grad}")
+        
         # get pointmaps in camera frame
         rel_ptmaps = _fast_depthmap_to_pts3d(depth, self._grid, focals, pp=pp)
+        
+        if not rel_ptmaps.requires_grad:
+            print(f"DEBUG: rel_ptmaps.requires_grad=False after _fast_depthmap_to_pts3d")
+            print(f"  depth.requires_grad={depth.requires_grad}")
+            print(f"  focals.requires_grad={focals.requires_grad}")
+        
         # project to world frame
-        return geotrf(im_poses, rel_ptmaps)
+        result = geotrf(im_poses, rel_ptmaps)
+        
+        if not result.requires_grad:
+            print(f"DEBUG: result.requires_grad=False after geotrf")
+            print(f"  im_poses.requires_grad={im_poses.requires_grad}")
+            print(f"  rel_ptmaps.requires_grad={rel_ptmaps.requires_grad}")
+        
+        return result
 
     def get_pts3d(self, raw=False):
         res = self.depth_to_pts3d()
