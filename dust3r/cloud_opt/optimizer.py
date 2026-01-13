@@ -25,40 +25,43 @@ class PointCloudOptimizer(BasePCOptimizer):
         self.has_im_poses = True  # by definition of this class
         self.focal_break = focal_break
 
-        # adding thing to optimize
-        self.im_depthmaps = nn.ParameterList(torch.randn(H, W)/10-3 for H, W in self.imshapes)  # log(depth)
-        self.im_poses = nn.ParameterList(self.rand_pose(self.POSE_DIM) for _ in range(self.n_imgs))  # camera poses
-        self.im_focals = nn.ParameterList(torch.FloatTensor(
-            [self.focal_break*np.log(max(H, W))]) for H, W in self.imshapes)  # camera intrinsics
-        self.im_pp = nn.ParameterList(torch.zeros((2,)) for _ in range(self.n_imgs))  # camera intrinsics
-        self.im_pp.requires_grad_(optimize_pp)
+        # CRITICAL: All tensor creation must happen outside inference mode
+        # ComfyUI runs in inference mode, but parameters must be normal tensors
+        with torch.inference_mode(False):
+            # adding thing to optimize
+            self.im_depthmaps = nn.ParameterList(nn.Parameter(torch.randn(H, W)/10-3) for H, W in self.imshapes)  # log(depth)
+            self.im_poses = nn.ParameterList(nn.Parameter(self.rand_pose(self.POSE_DIM)) for _ in range(self.n_imgs))  # camera poses
+            self.im_focals = nn.ParameterList(nn.Parameter(torch.FloatTensor(
+                [self.focal_break*np.log(max(H, W))])) for H, W in self.imshapes)  # camera intrinsics
+            self.im_pp = nn.ParameterList(nn.Parameter(torch.zeros((2,))) for _ in range(self.n_imgs))  # camera intrinsics
+            self.im_pp.requires_grad_(optimize_pp)
 
-        self.imshape = self.imshapes[0]
-        im_areas = [h*w for h, w in self.imshapes]
-        self.max_area = max(im_areas)
+            self.imshape = self.imshapes[0]
+            im_areas = [h*w for h, w in self.imshapes]
+            self.max_area = max(im_areas)
 
-        # adding thing to optimize
-        self.im_depthmaps = ParameterStack(self.im_depthmaps, is_param=True, fill=self.max_area)
-        self.im_poses = ParameterStack(self.im_poses, is_param=True)
-        self.im_focals = ParameterStack(self.im_focals, is_param=True)
-        self.im_pp = ParameterStack(self.im_pp, is_param=True)
-        self.register_buffer('_pp', torch.tensor([(w/2, h/2) for h, w in self.imshapes]))
-        self.register_buffer('_grid', ParameterStack(
-            [xy_grid(W, H, device=self.device) for H, W in self.imshapes], fill=self.max_area))
+            # adding thing to optimize
+            self.im_depthmaps = ParameterStack(self.im_depthmaps, is_param=True, fill=self.max_area)
+            self.im_poses = ParameterStack(self.im_poses, is_param=True)
+            self.im_focals = ParameterStack(self.im_focals, is_param=True)
+            self.im_pp = ParameterStack(self.im_pp, is_param=True)
+            self.register_buffer('_pp', torch.tensor([(w/2, h/2) for h, w in self.imshapes]))
+            self.register_buffer('_grid', ParameterStack(
+                [xy_grid(W, H, device=self.device) for H, W in self.imshapes], fill=self.max_area))
 
-        # pre-compute pixel weights
-        self.register_buffer('_weight_i', ParameterStack(
-            [self.conf_trf(self.conf_i[i_j]) for i_j in self.str_edges], fill=self.max_area))
-        self.register_buffer('_weight_j', ParameterStack(
-            [self.conf_trf(self.conf_j[i_j]) for i_j in self.str_edges], fill=self.max_area))
+            # pre-compute pixel weights
+            self.register_buffer('_weight_i', ParameterStack(
+                [self.conf_trf(self.conf_i[i_j]) for i_j in self.str_edges], fill=self.max_area))
+            self.register_buffer('_weight_j', ParameterStack(
+                [self.conf_trf(self.conf_j[i_j]) for i_j in self.str_edges], fill=self.max_area))
 
-        # precompute aa
-        self.register_buffer('_stacked_pred_i', ParameterStack(self.pred_i, self.str_edges, fill=self.max_area))
-        self.register_buffer('_stacked_pred_j', ParameterStack(self.pred_j, self.str_edges, fill=self.max_area))
-        self.register_buffer('_ei', torch.tensor([i for i, j in self.edges]))
-        self.register_buffer('_ej', torch.tensor([j for i, j in self.edges]))
-        self.total_area_i = sum([im_areas[i] for i, j in self.edges])
-        self.total_area_j = sum([im_areas[j] for i, j in self.edges])
+            # precompute aa
+            self.register_buffer('_stacked_pred_i', ParameterStack(self.pred_i, self.str_edges, fill=self.max_area))
+            self.register_buffer('_stacked_pred_j', ParameterStack(self.pred_j, self.str_edges, fill=self.max_area))
+            self.register_buffer('_ei', torch.tensor([i for i, j in self.edges]))
+            self.register_buffer('_ej', torch.tensor([j for i, j in self.edges]))
+            self.total_area_i = sum([im_areas[i] for i, j in self.edges])
+            self.total_area_j = sum([im_areas[j] for i, j in self.edges])
 
     def _check_all_imgs_are_selected(self, msk):
         assert np.all(self._get_msk_indices(msk) == np.arange(self.n_imgs)), 'incomplete mask!'
@@ -250,25 +253,26 @@ def ParameterStack(params, keys=None, is_param=None, fill=0):
     # Check if any param originally required grad, or if is_param is explicitly True
     requires_grad = params[0].requires_grad if hasattr(params[0], 'requires_grad') else False
     
-    # Stack the parameters - use clone().detach() to ensure fresh tensor
-    # Then convert to float for consistency
-    stacked = torch.stack(list(params)).float()
+    # CRITICAL: Exit inference mode when creating parameters
+    # ComfyUI runs in inference mode, but parameters must be normal tensors
+    # to allow optimizer.step() to update them
+    with torch.inference_mode(False):
+        # Stack the parameters - use clone().detach() to ensure fresh tensor
+        # Then convert to float for consistency
+        stacked = torch.stack(list(params)).float().detach().clone()
+        
+        # If is_param is True, create a Parameter that will track gradients
+        if is_param or requires_grad:
+            # Create Parameter from the data values (not connected to original graph)
+            # This is the standard way to initialize learnable parameters
+            result = nn.Parameter(stacked)
+            # requires_grad is True by default for nn.Parameter, but be explicit
+            result.requires_grad_(True)
+        else:
+            # For non-parameters, just return the detached tensor
+            result = stacked
     
-    # If is_param is True, create a Parameter that will track gradients
-    if is_param:
-        # Create Parameter from the data values (not connected to original graph)
-        # This is the standard way to initialize learnable parameters
-        params = nn.Parameter(stacked.detach().clone())
-        # requires_grad is True by default for nn.Parameter, but be explicit
-        params.requires_grad_(True)
-    elif requires_grad:
-        params = nn.Parameter(stacked.detach().clone())
-        params.requires_grad_(True)
-    else:
-        # For non-parameters, just return the detached tensor
-        params = stacked.detach()
-    
-    return params
+    return result
 
 
 def _ravel_hw(tensor, fill=0):

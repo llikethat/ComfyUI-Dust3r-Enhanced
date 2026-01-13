@@ -83,8 +83,12 @@ class BasePCOptimizer (nn.Module):
         self.norm_pw_scale = True
         self.pw_break = pw_break
         self.POSE_DIM = 7
-        self.pw_poses = nn.Parameter(rand_pose((self.n_edges, 1+self.POSE_DIM)))  # pairwise poses
-        self.pw_adaptors = nn.Parameter(torch.zeros((self.n_edges, 2)))  # slight xy/z adaptation
+        
+        # CRITICAL: Create parameters outside inference mode
+        # ComfyUI runs in inference mode, but parameters must be normal tensors
+        with torch.inference_mode(False):
+            self.pw_poses = nn.Parameter(rand_pose((self.n_edges, 1+self.POSE_DIM)))  # pairwise poses
+            self.pw_adaptors = nn.Parameter(torch.zeros((self.n_edges, 2)))  # slight xy/z adaptation
         self.pw_adaptors.requires_grad_(allow_pw_adaptors)
         self.has_im_poses = False
         self.rand_pose = rand_pose
@@ -130,10 +134,13 @@ class BasePCOptimizer (nn.Module):
 
     @torch.no_grad()
     def _compute_img_conf(self, pred1_conf, pred2_conf):
-        im_conf = nn.ParameterList([torch.zeros(hw, device=self.device) for hw in self.imshapes])
-        for e, (i, j) in enumerate(self.edges):
-            im_conf[i] = torch.maximum(im_conf[i], pred1_conf[e])
-            im_conf[j] = torch.maximum(im_conf[j], pred2_conf[e])
+        # CRITICAL: Create parameters outside inference mode
+        # ComfyUI runs in inference mode, but parameters must be normal tensors
+        with torch.inference_mode(False):
+            im_conf = nn.ParameterList([nn.Parameter(torch.zeros(hw, device=self.device)) for hw in self.imshapes])
+            for e, (i, j) in enumerate(self.edges):
+                im_conf[i].data = torch.maximum(im_conf[i].data, pred1_conf[e].detach().clone())
+                im_conf[j].data = torch.maximum(im_conf[j].data, pred2_conf[e].detach().clone())
         return im_conf
 
     def get_adaptors(self):
