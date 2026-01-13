@@ -214,24 +214,25 @@ class BasePCOptimizer (nn.Module):
 
     def _set_pose(self, poses, idx, R, T=None, scale=None, force=False):
         # all poses == cam-to-world
-        pose = poses[idx]
-        if not (pose.requires_grad or force):
-            return pose
-
+        # Note: poses may be a stacked Parameter, so we work with the data directly
+        
         if R.shape == (4, 4):
             assert T is None
             T = R[:3, 3]
             R = R[:3, :3]
 
-        if R is not None:
-            pose.data[0:4] = roma.rotmat_to_unitquat(R)
-        if T is not None:
-            pose.data[4:7] = signed_log1p(T / (scale or 1))  # translation is function of scale
+        with torch.no_grad():
+            if R is not None:
+                quat = roma.rotmat_to_unitquat(R)
+                poses.data[idx, 0:4] = quat
+            if T is not None:
+                poses.data[idx, 4:7] = signed_log1p(T / (scale or 1))  # translation is function of scale
 
-        if scale is not None:
-            assert poses.shape[-1] in (8, 13)
-            pose.data[-1] = np.log(float(scale))
-        return pose
+            if scale is not None:
+                assert poses.shape[-1] in (8, 13)
+                poses.data[idx, -1] = np.log(float(scale))
+        
+        return poses[idx]
 
     def get_pw_norm_scale_factor(self):
         if self.norm_pw_scale:

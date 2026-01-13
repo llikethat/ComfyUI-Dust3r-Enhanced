@@ -104,10 +104,10 @@ class PointCloudOptimizer(BasePCOptimizer):
         assert tensor.requires_grad, 'it must be True at this point, otherwise no modification occurs'
 
     def _set_focal(self, idx, focal, force=False):
-        param = self.im_focals[idx]
-        if param.requires_grad or force:  # can only init a parameter not already initialized
-            param.data[:] = self.focal_break * np.log(focal)
-        return param
+        # For stacked tensor, use direct index assignment
+        with torch.no_grad():
+            self.im_focals.data[idx, :] = self.focal_break * np.log(focal)
+        return self.im_focals[idx]
 
     def get_focals(self):
         """Get focal lengths from log-focals."""
@@ -151,11 +151,19 @@ class PointCloudOptimizer(BasePCOptimizer):
 
     def _set_depthmap(self, idx, depth, force=False):
         depth = _ravel_hw(depth, self.max_area)
+        
+        # Debug: print depth stats being set
+        print(f"  _set_depthmap({idx}): depth min={depth.min().item():.4f}, max={depth.max().item():.4f}, mean={depth.mean().item():.4f}")
 
-        param = self.im_depthmaps[idx]
-        if param.requires_grad or force:  # can only init a parameter not already initialized
-            param.data[:] = depth.log().nan_to_num(neginf=0)
-        return param
+        # For stacked tensor, we need to set data differently
+        # self.im_depthmaps is now a stacked Parameter, not a ParameterList
+        log_depth = depth.log().nan_to_num(neginf=0)
+        
+        # Use index assignment on the data directly
+        with torch.no_grad():
+            self.im_depthmaps.data[idx, :] = log_depth
+        
+        return self.im_depthmaps[idx]
 
     def get_depthmaps(self, raw=False):
         """Get depth maps, optionally raw (stacked) or as list."""
